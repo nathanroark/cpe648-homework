@@ -1,10 +1,25 @@
 # pyright: reportUnknownMemberType=false, reportUnusedCallResult=false
 
 """
-Mixed-Integer Quadratic Program (MIQP) Implementation using CVXPY
+Mixed-Integer Quadratic Program (MIQP) — CVXPY Implementation
 
-This script implements and solves a Mixed-Integer Quadratic Program (MIQP)
-using the CVXPY optimization library.
+This script formulates and solves problems of the form:
+
+    minimize    (1/2) x^T P x + q^T x
+    subject to  G x <= h
+                A x  = b
+                lb <= x <= ub
+                x[i] ∈ ℤ for i in integer_indices
+
+Where:
+- P ∈ ℝ^{n×n} is PSD (quadratic term), q ∈ ℝ^{n} (linear term).
+- G ∈ ℝ^{m×n}, h ∈ ℝ^{m} encode inequality constraints.
+- A ∈ ℝ^{p×n}, b ∈ ℝ^{p} encode equality constraints.
+- Bounds (lb, ub) are per-variable lower/upper limits.
+- A subset of indices in `integer_indices` are enforced integer.
+
+CVXPY builds the model and delegates the MIQP search (branch-and-bound over a
+continuous QP relaxation) to a backend solver (e.g., SCIP, CBC, ECOS_BB).
 """
 
 from __future__ import annotations
@@ -46,28 +61,52 @@ NumericLike = Number
 
 
 class SolveResults(TypedDict, total=False):
+    """
+    Container for solve results.
+
+    Keys:
+      - status (str): Solver termination status (e.g., "optimal", "infeasible").
+      - optimal_value (float | None): Objective value at the reported solution, if any.
+      - solution (np.ndarray | None): Primal solution x (shape: (n,)).
+      - solve_time (float | None): Wall-clock time reported by the solver (seconds).
+    """
+
     status: str
     optimal_value: object | None
     solution: npt.NDArray[np.float64] | None
     solve_time: float | None
 
 
-# class SolveResults(TypedDict, total=False):
-#     status: str
-#     # optimal_value: float | None
-#     # optimal_value: Number | bytes | complex | str | np.generic[Any] | memoryview | None
-#     optimal_value: NumericLike | None
-#     solution: npt.NDArray[np.float64] | None
-#     solve_time: float | None
-
-
 class MIQPSolver:
+    """
+    Helper class that owns CVXPY variables/constraints and wraps solve logic.
+
+    Attributes set during lifespan:
+      - n_vars (int): Number of decision variables n.
+      - integer_indices (list[int]): Indices of x that must be integer.
+      - verbose (bool): CVXPY solver verbosity flag.
+      - x (cp.Variable | None): Decision variable vector in CVXPY.
+      - problem (cp.Problem | None): The compiled CVXPY problem object.
+    """
+
     def __init__(
         self,
         n_vars: int,
         integer_indices: list[int] | None = None,
         verbose: bool = True,
     ) -> None:
+        """
+        Initialize the solver wrapper.
+
+        Args:
+          n_vars: Total number of decision variables (dimension of x).
+          integer_indices: Zero-based indices of x constrained to be integer.
+          verbose: If True, pass CVXPY's verbose flag to the underlying solver.
+
+        Notes:
+          - Only indices in `integer_indices` are integer; all others are continuous.
+          - The actual cp.Variable is created in `create_variables()`.
+        """
         self.n_vars: int = n_vars
         self.integer_indices: list[int] = integer_indices or []
         self.verbose: bool = bool(verbose)  # small nicety
@@ -79,11 +118,17 @@ class MIQPSolver:
 
     def create_variables(self) -> tuple[cp.Variable, cp.Variable | None]:
         """
-        Create decision variables with appropriate integer handling.
+        Allocate the CVXPY decision variable x with mixed-integrality.
 
-        Returns:
-            (x, z) where x is real-valued vector, and z is an integer
-            vector used only for indices in self.integer_indices (x[i] == z[i]).
+        Behavior:
+          - Creates a length-n variable x.
+          - For indices in `integer_indices`, sets the variable to be Integer; others stay Continuous.
+
+        Side effects:
+          - Sets `self.x`.
+
+        Raises:
+          - ValueError if n_vars is not positive.
         """
         x = cp.Variable(self.n_vars)  # continuous by default
 
@@ -108,19 +153,30 @@ class MIQPSolver:
         bounds: tuple[float | None, float | None] | None = None,
     ) -> cp.Problem:
         """
-        Formulate the MIQP problem.
+        Build the CVXPY objective and constraints.
 
         Args:
-            P: Positive semi-definite matrix for quadratic term (n x n)
-            q: Linear term coefficient vector (n,)
-            G: Inequality constraint matrix (m x n)
-            h: Inequality constraint bounds (m,)
-            A: Equality constraint matrix (k x n)
-            b: Equality constraint bounds (k,)
-            bounds: Optional (lower, upper) bounds for all variables
+          p: Quadratic matrix P (shape n×n). Should be PSD/symmetric for convexity.
+          q: Linear vector q (shape n,).
+          g: Inequality matrix G (m×n) or None if no inequalities.
+          h: Inequality RHS h (m,) or None if no inequalities.
+          a: Equality matrix A (p×n) or None if no equalities.
+          b: Equality RHS b (p,) or None if no equalities.
+          bounds: (lb, ub) where lb/ub are vectors of length n (or None) for elementwise bounds.
 
-        Returns:
-            Formulated CVXPY Problem
+        Constructs:
+          objective = (1/2) * quad_form(x, P) + q^T x
+          constraints = []
+            - If G, h given: Gx <= h
+            - If A, b given: Ax == b
+            - If lb/ub given: lb <= x <= ub
+            - Integrality comes from variable declaration in `create_variables`.
+
+        Side effects:
+          - Populates `self.problem` with a cp.Problem(Minimize(objective), constraints).
+
+        Raises:
+          - ValueError on shape mismatches.
         """
         # Ensure arrays have the right shape/dtype
         p = np.asarray(p, dtype=np.float64)
@@ -183,6 +239,25 @@ class MIQPSolver:
     def solve(
         self, solver: SolverName | None = None, **solver_options: object
     ) -> SolveResults:
+        """
+        Solve the MIQP using the selected backend (or try a small fallback list).
+
+        Args:
+          solver: Explicit backend selection; if None, try a reasonable sequence.
+
+        Returns:
+          A `SolveResults` dict populated with status, optimal_value, solution, and solve_time.
+
+        Notes:
+          - Mixed-integer search is handled by the backend via branch-and-bound.
+          - If you have licensed/commercial solvers (e.g., GUROBI/CPLEX/MOSEK) available
+            in your environment, you could extend SOLVER_MAP and the fallback list.
+          - `status` may be "optimal_inaccurate" or "feasible" depending on backend.
+
+        Raises:
+          - RuntimeError if the solver fails to return a successful status.
+          - ValueError if `formulate_problem()` has not been called.
+        """
         if self.problem is None:
             raise ValueError("Problem not formulated. Call formulate_problem() first.")
         assert self.x is not None
@@ -260,6 +335,16 @@ class MIQPSolver:
         return self.results
 
     def print_results(self) -> None:
+        """
+        Pretty-print the current solution stored in `self.problem`.
+
+        Prints:
+          - Status string
+          - Objective value
+          - First few entries of x (or full x depending on vector size)
+
+        Safe to call after a successful `solve()`. Will no-op or guard if not solved.
+        """
         print("\n" + "=" * 50)
         print("SOLUTION RESULTS")
         print("=" * 50)
@@ -302,6 +387,22 @@ def example_miqp_problem() -> None:
     - Quadratic objective (risk minimization)
     - Linear constraints (return, budget, nonnegativity)
     - Mixed integer constraints (some assets must be whole units)
+
+
+    Build a small, reproducible MIQP instance for demonstration/testing.
+
+    Returns:
+      Tuple of (P, q, G, h, A, b, lb, ub, returns, prices, integer_indices)
+
+    Where:
+      - P, q, G, h, A, b: MIQP data in standard form.
+      - lb, ub: Elementwise variable bounds (vectors of length n).
+      - returns, prices: Toy vectors to visualize portfolio-style metrics.
+      - integer_indices: Indices of x required to be integer in this example.
+
+    Notes:
+      - Values are synthetic; adjust to test different regimes (dense/sparse, tight/loose).
+      - P is constructed to be PSD to keep the QP relaxation convex.
     """
     print("\n" + "=" * 60)
     print("EXAMPLE: PORTFOLIO-STYLE MIQP WITH INTEGER CONSTRAINTS")
@@ -389,7 +490,25 @@ def visualize_portfolio(
     prices: npt.NDArray[np.float64],
     integer_indices: list[int],
 ) -> None:
-    """Visualize the portfolio allocation with types that satisfy basedpyright."""
+    """
+    Quick diagnostic plots for a portfolio-style interpretation of x.
+
+    Plots (2×2 grid):
+      1) Allocation x (bar): integers colored differently from continuous vars.
+      2) Dollar exposure x ⊙ prices.
+      3) Asset returns (%) as a reference bar chart.
+      4) Contribution to return (%) via x ⊙ returns.
+
+    Args:
+      x: Solution vector (n,).
+      returns: Per-asset returns (n,).
+      prices: Per-asset prices/weights (n,).
+      integer_indices: Indices of x that are integer in the model.
+
+    Notes:
+      - Intended for sanity checks; remove if your application is non-portfolio.
+      - Requires matplotlib; skip calling this in non-GUI or headless CI.
+    """
     n_assets: int = len(x)
 
     # Build figure/axes without subplots() so nothing is typed as Any
@@ -458,6 +577,16 @@ def visualize_portfolio(
 
 
 def main() -> None:
+    """
+    Entry point:
+      - Builds a toy MIQP with `example_miqp_problem()`.
+      - Creates variables and formulates the problem.
+      - Calls `solve()` with a chosen backend (defaults to a fallback order).
+      - Prints results and (optionally) visualizes.
+
+    How to run:
+      $ python miqp_solve.py
+    """
     example_miqp_problem()
 
     print("\n" + "=" * 60)
