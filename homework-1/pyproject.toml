@@ -11,3 +11,12 @@ dependencies = [
     "numpy>=2.3.3",
     "typing>=3.10.0.0",
 ]
+
+[tool.basedpyright]
+reportUnknownVariableType = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownParameterType = false
+reportUnknownLambdaType = false
+# reportUnknownListElementType = false
+# reportUnknownTupleElementType = false

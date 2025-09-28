@@ -583,9 +583,6 @@ def main() -> None:
       - Creates variables and formulates the problem.
       - Calls `solve()` with a chosen backend (defaults to a fallback order).
       - Prints results and (optionally) visualizes.
-
-    How to run:
-      $ python miqp_solve.py
     """
     example_miqp_problem()
 
